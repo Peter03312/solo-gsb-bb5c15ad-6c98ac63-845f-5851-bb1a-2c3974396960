@@ -19,6 +19,16 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_occurred_at ON events (occurred_at);
 
+-- 跨归档的 event_id 占用登记: 首次接收即在此占用, /retention/compact 只删
+-- events 中的事件内容, **不删本表**。因此即使事件已物理归档, 同一 event_id
+-- 重投仍被判为 duplicate, 不会再分配新 seq、不会作为新事件重复投递,
+-- 按 ID 保存的因果关系也始终指向首次接收的那条记录。
+CREATE TABLE IF NOT EXISTS received_event_ids (
+    event_id    TEXT PRIMARY KEY,               -- 幂等键: 首次接收后永久占用
+    seq         INTEGER NOT NULL,               -- 首次接收时分配的 seq(events.id), 归档后仍可按 ID 追溯
+    received_at TEXT NOT NULL                   -- 首次接收时间(UTC ISO8601)
+);
+
 CREATE TABLE IF NOT EXISTS consumers (
     consumer_id      TEXT PRIMARY KEY,
     cursor_seq       INTEGER NOT NULL DEFAULT 0,  -- 已确认到的 seq; 下次从 cursor_seq+1 投递(首次为 1)
@@ -137,6 +147,7 @@ def init_db() -> None:
         conn.executescript(SCHEMA)
         _migrate_chain_columns(conn)
         _backfill_chain(conn)
+        _backfill_received_ids(conn)
 
 
 def _migrate_chain_columns(conn: sqlite3.Connection) -> None:
@@ -176,6 +187,19 @@ def _backfill_chain(conn: sqlite3.Connection) -> None:
             (prev_hash, h, row["id"]),
         )
         prev_hash = h
+
+
+def _backfill_received_ids(conn: sqlite3.Connection) -> None:
+    """升级回填: 为当前所有未归档(events 表内)事件补齐 ID 占用登记。
+
+    升级时覆盖当前未归档事件即可; 旧版已被归档删除且无留存 ID 的历史记录
+    无法也不要求追溯。INSERT OR IGNORE 幂等: 已登记的首次占用信息原样保留,
+    重复执行(含新库启动)无副作用。
+    """
+    conn.execute(
+        "INSERT OR IGNORE INTO received_event_ids (event_id, seq, received_at)"
+        " SELECT event_id, id, received_at FROM events"
+    )
 
 
 @contextmanager
