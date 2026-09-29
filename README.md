@@ -1,6 +1,6 @@
 # Webhook 事件接收与重放 API
 
-基于 FastAPI + SQLite 的 Webhook 事件接收服务:按 `event_id` 幂等接收(支持单条与 1~1000 条批量、同一写事务续接哈希链)、记录首次接收顺序,支持时间范围分页查询与批量重放,并可创建按 UTC 日期分桶的事件计数视图。
+基于 FastAPI + SQLite 的 Webhook 事件接收服务:按 `event_id` 幂等接收(支持单条与 1~1000 条批量、同一写事务续接哈希链)、记录首次接收顺序,支持时间范围分页查询与批量重放,并可创建按 UTC 日期分桶的事件计数视图。**首次接收的 `event_id` 会永久占用**:即使事件内容之后被 `/retention/compact` 安全归档(物理删除),同一 ID 重投仍判为重复,不会分配新 `seq`、不会顶替按 ID 保存的因果关系。
 
 ## 启动
 
@@ -32,12 +32,14 @@ curl -X POST http://localhost:8000/events \
 # 重复: 200 {"status":"duplicate","event_id":"evt-1"}  —— 不产生重复记录
 ```
 
+**跨归档判重**:幂等依据是独立的永久占用表(首次接收与事件行**同一事务**写入),而不是 `events` 表本身。因此即使 `evt-1` 之后被 `/retention/compact` 物理删除,用相同 `event_id`(哪怕内容完全不同)再次投递仍返回 **200 `duplicate`**,不会得到新 `seq`、不会续接哈希链、不会更新日计数视图,也不会顶替按该 ID 已登记的因果关系。只有**从未见过的新 ID** 才入库、续链并更新视图。
+
 ### 1b. 批量接收事件(整批一个写事务)
 
 `POST /events/batch` 一次接收 **1~1000 条**与单条接口同格式的事件,请求体为 JSON 数组(不是包一层对象)。整批在**同一个写事务**(`BEGIN IMMEDIATE`)内处理,按请求顺序逐条判定 `event_id`:
 
-- **库中已有**、或**本批前面已出现过**的 ID 一律标记 `duplicate`,不写入、也不消耗 `seq`;
-- 仅首次出现的 ID 入库,并从当前链头按请求顺序**逐条续接哈希链**,`seq` 连续无空洞;
+- **已永久占用**(库中现存、或历史上已被归档删除)、或**本批前面已出现过**的 ID 一律标记 `duplicate`,不写入、也不消耗 `seq`;
+- 仅首次出现的 ID 入库,其占用行与事件行在**同一事务**写入,并从当前链头按请求顺序**逐条续接哈希链**,`seq` 连续无空洞;
 - 响应 `results` 严格按**输入顺序**返回每条的 `event_id`/`status`/`seq`(`duplicate` 的 `seq` 为 `null`),并汇总 `created`/`duplicate`;
 - 只要新建了至少一条就返回 **201**,全部重复为 **200**;
 - 任一条格式非法(字段缺失、`event_id` 为空、时间非法等)在事务开始前即被整体拒绝(**422**);写入过程中失败则事务回滚(**409**)——两种情况都**不会留下部分新事件**;
@@ -364,6 +366,45 @@ curl -s -X POST http://localhost:8000/retention/compact \
 curl -s http://localhost:8000/integrity
 ```
 
+### 10b. 跨归档幂等: ID 永久占用
+
+归档只删除**事件内容**(`events` 行),首次接收时与事件行同事务写入的 ID 占用记录**不会被删除**。因此同一个 `event_id` 在归档前后任何时刻重投,行为完全一致:
+
+| 场景 | 接口 | 状态码 / 结果 |
+|---|---|---|
+| 归档后单条重投 | `POST /events` | **200** `{"status":"duplicate","event_id":...}`,不写记录 |
+| 归档后批量重投(全部是旧 ID) | `POST /events/batch` | **200**,每条按原输入顺序 `duplicate`、`seq` 为 `null` |
+| 批量里既有旧 ID 又有新 ID | `POST /events/batch` | **201**;旧 ID 标 `duplicate`/`seq=null`,仅新 ID `created` 并续链 |
+| 全新 ID | 任一接收接口 | 正常入库、从链锚点续接哈希链、更新日计数视图 |
+
+```bash
+# evt-1 已在上面的归档示例中随 cutoff_seq=1000 被物理删除
+# 单条重投(哪怕 payload/occurred_at 完全不同): 仍是 duplicate
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/events \
+  -H 'Content-Type: application/json' \
+  -d '{"event_id":"evt-1","occurred_at":"2030-01-01T00:00:00Z","payload":{"totally":"different"}}'
+# => 200
+
+# 批量重投: 全重复 -> 200, 顺序保留, seq 全为 null; 混入新 ID 才是 201
+curl -s -w '\n[%{http_code}]\n' -X POST http://localhost:8000/events/batch \
+  -H 'Content-Type: application/json' \
+  -d '[
+    {"event_id":"evt-1","occurred_at":"2030-01-01T00:00:00Z","payload":{}},
+    {"event_id":"evt-999","occurred_at":"2026-09-29T10:00:00Z","payload":{"a":1}}
+  ]'
+# => {"created":1,"duplicate":1,"results":[
+#      {"event_id":"evt-1","status":"duplicate","seq":null},
+#      {"event_id":"evt-999","status":"created","seq":1001}]}
+#    [201]
+```
+
+要点:
+
+- **占用与写入/归档同事务**:`event_ids` 占用行与 `events` 行在接收事务中一起提交,归档删除内容时不触碰占用表——不会出现"内容已删但占用也丢了"的中间状态。
+- **只有新 ID 才续链与更新视图**:重复 ID(无论现存还是已归档)不插入 `events`、不推进哈希链、不增加日计数视图;归档扣减过的视图计数不会因旧 ID 重投而复活。
+- **按 ID 的因果关系稳定**:`event_relations` 中的 `event_id` 永远指向首次接收的那条记录(其原始 `seq` 保存在占用行中),重投不会产生同 ID 新记录来顶替它。
+- **升级即覆盖现存事件**:服务启动时自动把当前未归档事件的 ID 回填进占用表(可重复执行)。旧版本已归档删除、且没有留下任何 ID 记录的历史数据无法也不要求追溯——这类 ID 再次出现时按新事件接收;此后同样永久占用。
+
 ### 11. 持久化快照导出
 
 需要把某一时刻的事件流整体导出(对账、迁移、审计)时,可创建**持久化快照**:在**同一个数据库事务**内把当前全部未压缩事件(含链字段 `prev_hash`/`hash`)连同链锚点复制到独立的快照表,并返回快照 ID、锚点序号与哈希、末尾序号和总数:
@@ -610,16 +651,16 @@ curl -X PUT http://localhost:8000/relations/evt-c/parent \
 {"seq":1,"event_id":"evt-1","occurred_at":"...","payload":{...},"received_at":"...","prev_hash":""}
 ```
 
-重复 `event_id` 的投递走幂等返回,不会写入记录,链保持不变;`POST /events/batch` 中批量重复(库中已有或批内前面已出现)的条目同样跳过,只有新建条目参与续链。任何对历史记录的字段篡改、删除或重排都会被 `/integrity` 在首个断点处检出。
+重复 `event_id` 的投递走幂等返回,不会写入记录,链保持不变;**即使该事件此前已被压缩归档,ID 占用仍在,重投同样跳过**。`POST /events/batch` 中批量重复(已永久占用或批内前面已出现)的条目同样跳过,只有新建条目参与续链。任何对历史记录的字段篡改、删除或重排都会被 `/integrity` 在首个断点处检出。
 
 **链锚点**:压缩归档删除的历史前缀由单行表 `chain_anchor` 记录——`anchor_seq`(已压缩到的最大 seq)与 `anchor_hash`(最后被删记录的哈希)。锚点之后的第一条现存记录必须 `seq = anchor_seq + 1` 且 `prev_hash = anchor_hash`;事件表为空时新写入的记录也从锚点哈希续链,因此压缩不会削弱后续记录的防篡改能力。
 
-**旧库迁移**:启动时自动为已有 SQLite 数据补加 `prev_hash`/`hash` 列并按首次接收顺序回填整条链,无需手工操作;迁移可重复执行(幂等)。
+**旧库迁移**:启动时自动为已有 SQLite 数据补加 `prev_hash`/`hash` 列并按首次接收顺序回填整条链;同时自动创建 `event_ids` 永久占用表,并把**当前仍在 `events` 表中的未归档事件**按其 `event_id`/`id`/`received_at` 回填(跨归档判重从升级时刻起对现存事件生效)。旧版本已压缩删除、未留下任何 ID 记录的历史数据不追溯。迁移均可重复执行(幂等),无需手工操作。
 
 ## 设计要点
 
-- **幂等**:`event_id` 上有 `UNIQUE` 约束,重复插入触发 `IntegrityError` 后返回 200 `duplicate`,并发下也不会产生重复记录。
-- **批量接收**:`POST /events/batch` 接受 1~1000 条同格式事件的 JSON 数组,在单个 `BEGIN IMMEDIATE` 事务内"一次查齐库中已存在的 `event_id` + 用批内 `seen` 集合追踪 → 按输入顺序逐条判重、续链接入"。库中已有或批内重复的条目标记 `duplicate`(`seq` 为 null)且不消耗 seq,新建条目 `seq` 连续;响应 `results` 按输入顺序返回并汇总 `created`/`duplicate`,有新建即 201、全重复 200。格式非法在事务前整体 422,写入冲突回滚整批(409),任何失败路径都不留部分新事件;与单条接口共用同一判重逻辑与哈希链,单条/批量可任意交错提交。
+- **幂等(跨归档永久占用)**:判重不依赖 `events.event_id UNIQUE` 本身,而依据独立的永久占用表 `event_ids`(`event_id` 主键,另存首次 `seq`/`received_at`)。占用行在接收事务中与事件行**同事务插入**,`/retention/compact` 只删 `events` 中的事件内容、不删占用行;因此 ID 一旦首次接收即持续占用,归档后重投仍返回 200 `duplicate`,不会分配新 seq、不续链、不更新视图,按 ID 保存的关系也始终指向首次记录。服务启动时自动把当前未归档事件回填进占用表(覆盖升级);旧版已删除且无留存 ID 的历史不追溯。并发由 `BEGIN IMMEDIATE` 写锁串行化,占用表主键约束兜底。
+- **批量接收**:`POST /events/batch` 接受 1~1000 条同格式事件的 JSON 数组,在单个 `BEGIN IMMEDIATE` 事务内"一次查齐永久占用的 `event_id`(含已归档 ID) + 用批内 `seen` 集合追踪 → 按输入顺序逐条判重、续链接入"。已占用(现存或已归档)或批内重复的条目标记 `duplicate`(`seq` 为 null)且不消耗 seq,新建条目(事件行与占用行同事务写入)`seq` 连续;响应 `results` 按输入顺序返回并汇总 `created`/`duplicate`,有新建即 201、全重复 200。格式非法在事务前整体 422,写入冲突回滚整批(409),任何失败路径都不留部分新事件;与单条接口共用同一判重逻辑与哈希链,单条/批量可任意交错提交。
 - **接收顺序**:自增主键 `id` 即首次接收顺序,重放按它排序。
 - **完整性哈希链**:每条记录引用上一条哈希,写入与链字段更新在同一事务完成(`BEGIN IMMEDIATE` 保证并发下链头一致);`GET /integrity` 全链校验。
 - **时间比较**:`occurred_at` 归一化为 UTC ISO8601 字符串存储,范围查询走字典序比较,并建有索引。
@@ -627,7 +668,7 @@ curl -X PUT http://localhost:8000/relations/evt-c/parent \
 - **前缀确认**:`POST /consumers/{consumer_id}/ack-prefix` 与 `ack` 共用同一套租约校验,额外要求 `through_seq` 落在 `[lease_from_seq, lease_to_seq]`;在单个 `BEGIN IMMEDIATE` 事务内把游标推进到 `through_seq` 并清除租约,旧 token 立即作废,下次 `pull` 从 `through_seq+1` 重新租用。`through_seq` 等于批次末尾即整批确认;未知 consumer、过期/伪造/旧 token、序号越界均 409 且状态不变。
 - **游标回退**:`POST /consumers/{consumer_id}/rewind` 在单个 `BEGIN IMMEDIATE` 事务内完成"校验 consumer/租约/回退区间 `[anchor_seq, cursor_seq]` → 清除已过期租约 → 回退游标",与 `pull`/`ack`/`ack-prefix`/`compact` 串行,并发下只有单一结果。未过期租约、低于链锚点、向前推进、未知 consumer 均 409 且状态不变;回退后游标不低于链锚点,不会产生指向已压缩事件的租约。
 - **毒丸隔离**:`POST /consumers/{consumer_id}/quarantine` 在单个 `BEGIN IMMEDIATE` 事务内完成"核对令牌(与 `ack` 同套:无租约/过期/旧令牌 409)→ 核对租约起点与游标相邻(考虑链锚点)→ 复制首条事件完整内容、原哈希与非空原因到独立 `quarantined_events` 表 → 游标仅越过这一条并清除整批租约"。下次 `pull` 重新租用剩余事件并换发新 token,旧令牌立即作废;失败原因空白返回 422。`GET /consumers/{consumer_id}/quarantine` 分页查看隔离记录;副本独立于原事件存储,原事件被压缩归档(物理删除)后仍可查看。隔离会把游标推进过该事件,因此被隔离事件视为"已处理",可正常纳入安全归档,内容由隔离副本留存。
-- **安全归档压缩**:`POST /retention/compact` 在单个 `BEGIN IMMEDIATE` 事务内完成"读锚点 → 算安全边界(所有 consumer 的最小 `cursor_seq`,无 consumer 时为当前最大 seq)→ 校验 `cutoff_seq` → 删连续前缀 → 写链锚点"。越界 409 并返回 `safe_through_seq`;`dry_run` 只算不写;已覆盖区间幂等返回 `noop`。
+- **安全归档压缩**:`POST /retention/compact` 在单个 `BEGIN IMMEDIATE` 事务内完成"读锚点 → 算安全边界(所有 consumer 的最小 `cursor_seq`,无 consumer 时为当前最大 seq)→ 校验 `cutoff_seq` → 删连续前缀(只删 `events` 事件内容,**不删 `event_ids` 占用行**)→ 写链锚点"。越界 409 并返回 `safe_through_seq`;`dry_run` 只算不写;已覆盖区间幂等返回 `noop`。归档后同一 `event_id` 重投仍判重(见"跨归档永久占用"),只有新 ID 从锚点哈希续链。
 - **持久化快照导出**:`POST /exports` 在单个 `BEGIN IMMEDIATE` 事务内完成"读链锚点 → 写快照元数据(锚点 seq/hash、末尾 seq、总数)→ `INSERT ... SELECT` 整体复制当前全部未压缩事件到 `export_events`",与事件写入、压缩归档串行,副本与元数据来自同一时刻。副本落库后不可变:`GET /exports/{id}/events` 只查快照表,按 `(snapshot_id, seq)` 主键升序分页(多取一条判断 `next_after_seq`,末页为 `null`),后续写入/压缩/重启均不影响;`after_seq` 越出 `[anchor_seq, end_seq]` 返回 422。`DELETE /exports/{id}` 在同一事务内删除画像统计(`export_field_coverage` 及其路径表)、事件副本与元数据,未知或已删除统一 404。
 - **快照字段覆盖画像**:`GET /exports/{id}/field-coverage` 只读 `export_events` 副本(不读不写 events、不返回字段值),对每条 payload 用显式栈迭代递归(避免深层 JSON 触发递归上限),产出 (路径, JSON 类型) 集合:根路径 `""`、对象键把 `~`/`/`/`*` 转义为 `~0`/`~1`/`~2`、数组下标统一 `*`、空数组不产生元素路径。聚合时**出现按路径、类型按 (路径, 类型) 双重去重**——同一事件同路径只计一次、每种类型也只计一次,因此混合数组的类型数之和可超过出现数,`null` 计为出现,`missing = total - present`。**路径统计惰性持久化**:首次查询(含历史快照)在单个 `BEGIN IMMEDIATE` 事务内把副本全量扫描一次、聚合并把统计头(total/路径数)与每个路径的六类计数写入 `export_field_coverage` / `export_field_coverage_paths`(`WITHOUT ROWID`,`(snapshot_id, path)` 复合主键),同事务原子提交,无半成品;并发首次查询经写锁 + 持锁复查串行化,只计算一次、不重复写入,与删除快照互斥(等待期间快照被删则返回 404)。之后翻页仅按主键做 `path > cursor` 范围读取本页(查询计划为主键 SEARCH),延迟与事件数无关,重启后复用,且**绝不从当前 events 补算**;`POST /exports` 不预生成,空快照只落 `total=0` 统计头。分页只取严格大于 `after_path` 的项(缺省从根 `""` 起含根,显式空串游标则跳过根;末页 `next_after_path` 为 null)。空快照返回 `total=0` 空列表;未知/已删除 404,`limit` 越界或游标不是合法转义(非根不以 `/` 开头、裸 `~n`、键段内裸 `*`)422。`DELETE /exports/{id}` 同事务清理统计与副本。不改动既有 `/exports/{id}/events` 导出接口。
 - **事件日计数视图**:规则存 `count_views`(名称 `UNIQUE`,重名 409),日桶计数存 `count_view_buckets`(`(view_id, day)` 主键)。`POST /views` 在单个 `BEGIN IMMEDIATE` 事务内"保存规则 → 全量扫描现存事件按 UTC 日期回填";`/events` 与 `/events/batch` 只对真正新建的条目逐视图匹配增量 +1(重复 `event_id` 走幂等分支,不动视图);`/retention/compact` 在同一事务内对被删前缀逐条扣减并移除空桶——因此视图始终等于"当前 events 表内匹配事件按发生日期的计数",迟到事件按 `occurred_at` 归其发生日期。`GET /views/{name}` 按名称返回各日计数与总数,`DELETE /views/{name}` 单事务删除规则与日桶,未知名称均 404。
@@ -638,8 +679,8 @@ curl -X PUT http://localhost:8000/relations/evt-c/parent \
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/events` | 接收单个事件(幂等) |
-| POST | `/events/batch` | 批量接收 1~1000 条事件(JSON 数组,单写事务):库中已有/批内重复标 `duplicate` 不写,新建按序续链;响应按输入顺序给出状态与 `seq`,整批失败无部分写入 |
+| POST | `/events` | 接收单个事件(幂等):首次接收的 ID 永久占用,事件归档后重投仍返回 200 duplicate |
+| POST | `/events/batch` | 批量接收 1~1000 条事件(JSON 数组,单写事务):已永久占用(含已归档)/批内重复标 `duplicate` 不写,新建按序续链;响应按输入顺序给出状态与 `seq`(duplicate 为 null),全重复 200、含新建 201,整批失败无部分写入 |
 | GET | `/events` | 时间范围分页查询(`from`/`to`/`page`/`page_size`) |
 | POST | `/replay` | 批量重放,按首次接收顺序输出 |
 | GET | `/integrity` | 从链锚点校验完整性哈希链,返回 `verified`/`checked`/`first_break`/`anchor_seq` |

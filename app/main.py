@@ -399,13 +399,23 @@ def insert_chained_event(
     received_at: str,
     prev_hash: str,
 ) -> tuple[int, str]:
-    """在当前写事务内插入一条事件并续接哈希链, 返回 (新 seq, 本记录哈希)。调用方须持有写事务。"""
+    """在当前写事务内插入一条事件并续接哈希链, 返回 (新 seq, 本记录哈希)。
+
+    同时把 event_id 写入永久占用表 event_ids: 占用行与事件行同事务提交,
+    之后即使事件内容被 /retention/compact 物理删除, 该 ID 仍持续占用,
+    重投只会被判重而不会分配新 seq。调用方须持有写事务并已完成判重。
+    """
     cur = conn.execute(
         "INSERT INTO events (event_id, occurred_at, payload, received_at)"
         " VALUES (?, ?, ?, ?)",
         (event_id, occurred_at, json.dumps(payload, ensure_ascii=False), received_at),
     )
     seq = cur.lastrowid
+    # 跨归档幂等占用: 不随 compact 删除, seq 永远指向首次接收的那条记录
+    conn.execute(
+        "INSERT INTO event_ids (event_id, seq, received_at) VALUES (?, ?, ?)",
+        (event_id, seq, received_at),
+    )
     h = record_hash(
         seq=seq,
         event_id=event_id,
@@ -428,13 +438,27 @@ def health() -> dict[str, str]:
 
 @app.post("/events", status_code=201)
 def create_event(event: EventIn):
-    """接收单个事件, 按 event_id 幂等: 重复投递不产生重复记录, 也不改变哈希链。"""
+    """接收单个事件, 按 event_id 幂等: 重复投递不产生重复记录, 也不改变哈希链。
+
+    判重依据是永久占用表 event_ids 而非 events 表本身: 首次接收的 ID 与事件行
+    同事务写入占用, 之后即使事件内容被 /retention/compact 物理删除, ID 仍持续
+    占用——跨归档重投同样返回 200 duplicate, 不会分配新 seq、不续链、不动视图。
+    """
     received_at = utc_now()
     occurred_at = normalize_dt(event.occurred_at)
-    try:
-        with get_conn() as conn:
-            # BEGIN IMMEDIATE 提前获取写锁, 保证"读链头 -> 写入"在同一事务内原子完成
-            conn.execute("BEGIN IMMEDIATE")
+    with get_conn() as conn:
+        # BEGIN IMMEDIATE 提前获取写锁, 保证"判重 -> 读链头 -> 写入"原子完成
+        conn.execute("BEGIN IMMEDIATE")
+        occupied = conn.execute(
+            "SELECT 1 FROM event_ids WHERE event_id = ?", (event.event_id,)
+        ).fetchone()
+        if occupied is not None:
+            # 库中现存或历史已归档的 ID 一律幂等返回: 不写记录, 链与视图不变
+            return JSONResponse(
+                status_code=200,
+                content={"status": "duplicate", "event_id": event.event_id},
+            )
+        try:
             prev_hash = current_chain_head(conn)
             insert_chained_event(
                 conn,
@@ -444,14 +468,15 @@ def create_event(event: EventIn):
                 received_at=received_at,
                 prev_hash=prev_hash,
             )
-            # 同一事务内增量更新日计数视图; 重复 event_id 走 IntegrityError 分支, 不会到此
+            # 同一事务内增量更新日计数视图; 重复 event_id 在上面提前返回, 不会到此
             apply_event_to_views(conn, occurred_at=occurred_at, payload=event.payload)
-    except sqlite3.IntegrityError:
-        # event_id 已存在 -> 幂等返回, 不写入重复记录, 链保持不变
-        return JSONResponse(
-            status_code=200,
-            content={"status": "duplicate", "event_id": event.event_id},
-        )
+        except sqlite3.IntegrityError:
+            # 并发兜底(理论上被写锁串行化后不会触发): 重复即幂等返回, 事务回滚
+            conn.rollback()
+            return JSONResponse(
+                status_code=200,
+                content={"status": "duplicate", "event_id": event.event_id},
+            )
     return {"status": "created", "event_id": event.event_id}
 
 
@@ -461,8 +486,9 @@ def create_events_batch(
 ):
     """批量接收 1~1000 条事件(与单条接口同格式的 JSON 数组), 整批在同一写事务中处理。
 
-    - 按请求顺序逐条判定 event_id: 库中已有、或本批前面已出现过的 ID 标记
-      duplicate, 不写入、不消耗 seq; 仅首次出现的 ID 入库。
+    - 按请求顺序逐条判定 event_id: 永久占用表中已有(库中现存或历史已归档)、
+      或本批前面已出现过的 ID 标记 duplicate, 不写入、不消耗 seq; 仅首次出现
+      的 ID 入库, 并与事件行同事务写入占用。
     - 新事件按请求顺序从当前链头逐条续接哈希链, seq 连续无空洞。
     - 任一条格式非法(422, 校验在事务前完成)或写入失败(事务回滚)时,
       整批不留下部分新事件。
@@ -479,12 +505,13 @@ def create_events_batch(
         try:
             # BEGIN IMMEDIATE 提前获取写锁: 判定重复 -> 批量写入在同一事务内原子完成
             conn.execute("BEGIN IMMEDIATE")
-            # 库中已存在的 event_id 一次取齐; 本批内首次出现的 ID 实时加入 seen
+            # 已永久占用的 event_id(含内容已归档的 ID)一次取齐; 本批内首次
+            # 出现的 ID 实时加入 seen
             placeholders = ",".join("?" * len(normalized))
             existing = {
                 row["event_id"]
                 for row in conn.execute(
-                    f"SELECT event_id FROM events WHERE event_id IN ({placeholders})",
+                    f"SELECT event_id FROM event_ids WHERE event_id IN ({placeholders})",
                     [eid for eid, _, _ in normalized],
                 ).fetchall()
             }
@@ -493,12 +520,13 @@ def create_events_batch(
 
             for event_id, occurred_at, payload in normalized:
                 if event_id in seen:
-                    # 库中已有或本批前面出现过: 幂等跳过, 不写入也不推进链头
+                    # 已永久占用(现存或已归档)或本批前面出现过: 幂等跳过,
+                    # 不写入、不占用新 seq、不推进链头
                     results.append(
                         {"event_id": event_id, "status": "duplicate", "seq": None}
                     )
                     continue
-                # 唯一约束兜底(写锁下理论上不会冲突): 冲突即放弃整批
+                # 占用表主键兜底(写锁下理论上不会冲突): 冲突即放弃整批
                 seq, h = insert_chained_event(
                     conn,
                     event_id=event_id,
@@ -1037,6 +1065,9 @@ def compact(req: CompactIn):
       无 consumer 时以当前最大 seq 为边界。越界返回 409 并给出 safe_through_seq。
     - 执行时持久化最后一条被删记录的 seq/hash 作为链锚点, /integrity 从锚点继续校验。
     - 同一事务内按被删事件扣减所有日计数视图的对应日期计数(空桶移除)。
+    - 只删除 events 中的事件内容, event_ids 中的 ID 占用行保留: 归档后同一
+      event_id 重投仍判重(单条 200 duplicate; 批量 duplicate/seq=null),
+      只有全新 ID 才从锚点续链。
     - dry_run=true 只返回预计删除数与边界, 不写库。
     - cutoff_seq 已被既往压缩覆盖时为幂等空操作, 不再校验安全边界。
     """

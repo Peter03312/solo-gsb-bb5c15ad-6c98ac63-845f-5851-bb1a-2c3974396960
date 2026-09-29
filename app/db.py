@@ -19,6 +19,15 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_occurred_at ON events (occurred_at);
 
+-- 跨归档幂等占用: 事件首次接收时与 events 行同事务写入; /retention/compact
+-- 只物理删除 events 中的事件内容, 不删除本表。因此同一 event_id 即使在内容
+-- 归档后重投也仍被判为 duplicate, 不会分配新 seq、不会顶替按 ID 保存的关系。
+CREATE TABLE IF NOT EXISTS event_ids (
+    event_id    TEXT PRIMARY KEY,                  -- 首次接收即永久占用的幂等键
+    seq         INTEGER NOT NULL,                  -- 首次接收分配的 seq(events.id)
+    received_at TEXT NOT NULL                      -- 首次接收时间(UTC ISO8601, 审计留痕)
+);
+
 CREATE TABLE IF NOT EXISTS consumers (
     consumer_id      TEXT PRIMARY KEY,
     cursor_seq       INTEGER NOT NULL DEFAULT 0,  -- 已确认到的 seq; 下次从 cursor_seq+1 投递(首次为 1)
@@ -137,6 +146,7 @@ def init_db() -> None:
         conn.executescript(SCHEMA)
         _migrate_chain_columns(conn)
         _backfill_chain(conn)
+        _backfill_event_ids(conn)
 
 
 def _migrate_chain_columns(conn: sqlite3.Connection) -> None:
@@ -146,6 +156,18 @@ def _migrate_chain_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE events ADD COLUMN prev_hash TEXT")
     if "hash" not in cols:
         conn.execute("ALTER TABLE events ADD COLUMN hash TEXT")
+
+
+def _backfill_event_ids(conn: sqlite3.Connection) -> None:
+    """升级时把当前仍存在(未归档)的事件 ID 补入永久占用表。
+
+    旧版本在 compact 时只删了 events 行、没有留下任何 ID 记录, 这类历史 ID
+    无法也不要求追溯; INSERT OR IGNORE 保证可重复执行且不覆盖既有占用。
+    """
+    conn.execute(
+        "INSERT OR IGNORE INTO event_ids (event_id, seq, received_at)"
+        " SELECT event_id, id, received_at FROM events"
+    )
 
 
 def _backfill_chain(conn: sqlite3.Connection) -> None:
